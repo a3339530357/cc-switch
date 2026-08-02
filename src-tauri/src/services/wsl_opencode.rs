@@ -36,6 +36,40 @@ pub(crate) fn is_valid_distro_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// 解码 `wsl.exe` 的 stdout 字节。
+///
+/// `wsl.exe` 在无控制台（GUI 进程捕获输出）时以 **UTF-16LE**（每字符后跟
+/// `0x00`）输出，直接按 UTF-8 解码会得到带 NUL 的乱码。这里先按 UTF-16LE
+/// 解码，非 UTF-16LE 时回退到 UTF-8 lossy。
+///
+/// 判据：ASCII 内容转 UTF-16LE 后，每个字符的高字节都是 `0x00`，因此只要
+/// 字节数为偶数且奇数位（高字节）大量为 0，就按 UTF-16LE 处理。
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn decode_wsl_stdout(bytes: &[u8]) -> String {
+    let bytes = bytes
+        .strip_prefix(&[0xFF, 0xFE])
+        .or_else(|| bytes.strip_prefix(&[0xFE, 0xFF]))
+        .unwrap_or(bytes);
+
+    let utf16le = bytes.len() % 2 == 0
+        && bytes.len() >= 2
+        && {
+            let zeroes = bytes[1..].iter().step_by(2).filter(|&&b| b == 0).count();
+            let high_bytes = bytes[1..].len().div_ceil(2);
+            zeroes * 2 >= high_bytes
+        };
+
+    if utf16le {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap_or_default()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 /// 解析 `wsl.exe --list --quiet` 输出，返回发行版名称列表。
 ///
 /// 兼容两种情况：
@@ -84,7 +118,7 @@ pub fn discover_sources() -> Vec<WslOpencodeSource> {
         .output()
     {
         Ok(out) if out.status.success() => {
-            parse_wsl_list_output(&String::from_utf8_lossy(&out.stdout))
+            parse_wsl_list_output(&decode_wsl_stdout(&out.stdout))
         }
         _ => return Vec::new(),
     };
@@ -239,5 +273,37 @@ mod tests {
         assert!(!is_valid_distro_name("has space"));
         assert!(!is_valid_distro_name("bad;name"));
         assert!(!is_valid_distro_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn test_decode_wsl_stdout_utf16le() {
+        // 真实抓到的 wsl.exe --list --quiet 输出（UTF-16LE + CRLF）
+        let raw = b"U\x00b\x00u\x00n\x00t\x00u\x00\r\x00\n\x00d\x00o\x00c\x00k\x00e\x00r\x00-\x00d\x00e\x00s\x00k\x00t\x00o\x00p\x00\r\x00\n\x00";
+        let decoded = decode_wsl_stdout(raw);
+        assert_eq!(decoded, "Ubuntu\r\ndocker-desktop\r\n");
+        assert_eq!(
+            parse_wsl_list_output(&decoded),
+            vec!["Ubuntu", "docker-desktop"]
+        );
+    }
+
+    #[test]
+    fn test_decode_wsl_stdout_utf8_fallback() {
+        assert_eq!(decode_wsl_stdout(b"Ubuntu\ndebian\n"), "Ubuntu\ndebian\n");
+        assert_eq!(decode_wsl_stdout(b""), "");
+    }
+
+    #[test]
+    fn test_decode_wsl_stdout_utf16le_with_bom() {
+        let raw = b"\xff\xfeU\x00b\x00u\x00n\x00t\x00u\x00\r\x00\n\x00";
+        assert_eq!(decode_wsl_stdout(raw), "Ubuntu\r\n");
+    }
+
+    #[test]
+    fn test_decode_wsl_stdout_end_to_end_utf16le() {
+        // 端到端：真实字节 -> 发行版列表
+        let raw = b"U\x00b\x00u\x00n\x00t\x00u\x00\r\x00\n\x00d\x00o\x00c\x00k\x00e\x00r\x00-\x00d\x00e\x00s\x00k\x00t\x00o\x00p\x00\r\x00\n\x00";
+        let distros = parse_wsl_list_output(&decode_wsl_stdout(raw));
+        assert_eq!(distros, vec!["Ubuntu", "docker-desktop"]);
     }
 }
