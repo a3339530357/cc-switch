@@ -68,10 +68,9 @@ jobs:
             Write-Warning 'No MSI installer found'
           }
 
-          $exe = Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Recurse -Include *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $exe) {
-            $exe = Get-ChildItem -Path 'src-tauri/target/release' -Filter 'cc-switch.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
+          # 便携版用真正的应用 exe（target/release/cc-switch.exe），
+          # 不要误用 bundle/nsis 下的安装器 exe。
+          $exe = Get-ChildItem -Path 'src-tauri/target/release' -Filter 'cc-switch.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($null -ne $exe) {
             $portableDir = 'release-assets/portable'
             New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
