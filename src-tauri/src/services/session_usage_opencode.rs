@@ -1,14 +1,18 @@
 //! OpenCode 会话日志使用追踪
 //!
 //! 从 ~/.local/share/opencode/opencode.db (SQLite) 中提取精确 token 使用数据。
+//! Windows 宿主上还会额外同步 WSL 发行版内的 opencode.db（见 `wsl_opencode` 模块）。
 //!
 //! ## 数据流
 //! ```text
-//! ~/.local/share/opencode/opencode.db
+//! ~/.local/share/opencode/opencode.db（本机）
 //!   → session 表获取所有会话
 //!   → message 表获取 assistant 消息
 //!   → 解析 data JSON 提取 tokens/cost/model
 //!   → proxy_request_logs 表
+//!
+//! \\wsl$\<distro>\home\<user>\.local\share\opencode\opencode.db（WSL，仅 Windows）
+//!   → 暂存到 ~/.cc-switch/wsl-opencode/<distro>/ 后走同一流程
 //! ```
 
 use crate::database::{lock_conn, Database};
@@ -22,6 +26,7 @@ use crate::services::session_usage::{
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
 use std::fs;
+use std::path::Path;
 use std::time::SystemTime;
 
 /// 从 opencode message.data JSON 中提取的 token 和费用数据
@@ -41,38 +46,91 @@ struct OpenCodeMessageQueryResult {
     has_incomplete_usage: bool,
 }
 
-/// 同步 OpenCode 使用数据
+/// 同步 OpenCode 使用数据。
+///
+/// 数据源：
+/// - 本机 `opencode.db`（`get_opencode_db_path()`）；
+/// - Windows 宿主上，额外发现 WSL 发行版内的 `opencode.db`
+///   （见 [`crate::services::wsl_opencode`]）。
 pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
-    let db_path = get_opencode_db_path();
+    let mut aggregate = SessionSyncResult::default();
 
-    if !db_path.exists() {
-        return Ok(SessionSyncResult {
-            imported: 0,
-            skipped: 0,
-            files_scanned: 0,
-            suspected_duplicates: 0,
-            deferred_files: 0,
-            errors: vec![],
-        });
+    // 1) 本机 opencode.db
+    let local_path = get_opencode_db_path();
+    if local_path.exists() {
+        let file_modified = max_modified_nanos(&local_path);
+        aggregate.merge(sync_from_db(
+            db,
+            &local_path,
+            &local_path.to_string_lossy(),
+            file_modified,
+        )?);
     }
 
-    let db_path_str = db_path.to_string_lossy().to_string();
+    // 2) Windows 宿主上的 WSL 发行版内的 opencode.db
+    #[cfg(target_os = "windows")]
+    {
+        for source in crate::services::wsl_opencode::discover_sources() {
+            let mut step = SessionSyncResult::default();
+            step.files_scanned += 1;
 
-    // 检查文件修改时间。
-    // opencode 的数据库运行在 WAL 模式：新提交先落在 -wal 文件里，
-    // 主库文件只有在 checkpoint 时才更新。因此必须同时考虑 -wal 的
-    // mtime，否则会在 checkpoint 之前漏掉刚写入的会话。
-    let metadata = fs::metadata(&db_path)
-        .map_err(|e| AppError::Config(format!("无法读取 opencode.db 元数据: {e}")))?;
-    let mut file_modified = metadata_modified_nanos(&metadata);
+            match crate::services::wsl_opencode::stage_source(&source) {
+                Ok(local_copy) => {
+                    // 用稳定的源标识做同步水位，避免缓存路径变化导致重复同步
+                    let sync_key =
+                        format!("wsl:{}:{}", source.distro, source.remote_db_path.display());
+                    match sync_from_db(db, &local_copy, &sync_key, source.remote_modified_nanos) {
+                        Ok(r) => aggregate.merge(r),
+                        Err(e) => step
+                            .errors
+                            .push(format!("WSL[{}] OpenCode 同步失败: {e}", source.distro)),
+                    }
+                }
+                Err(e) => step.errors.push(format!(
+                    "WSL[{}] OpenCode 数据库暂存失败: {e}",
+                    source.distro
+                )),
+            }
+
+            aggregate.merge(step);
+        }
+    }
+
+    Ok(aggregate)
+}
+
+/// 计算 opencode.db 文件的最新 mtime（纳秒），与 `-wal` 取较大值。
+///
+/// opencode 的数据库运行在 WAL 模式：新提交先落在 `-wal` 文件里，
+/// 主库文件只有在 checkpoint 时才更新。因此必须同时考虑 `-wal` 的
+/// mtime，否则会在 checkpoint 之前漏掉刚写入的会话。
+fn max_modified_nanos(db_path: &Path) -> i64 {
+    let mut file_modified = fs::metadata(db_path)
+        .ok()
+        .map(|metadata| metadata_modified_nanos(&metadata))
+        .unwrap_or(0);
 
     let wal_path = db_path.with_extension("db-wal");
     if let Ok(wal_meta) = fs::metadata(&wal_path) {
         file_modified = file_modified.max(metadata_modified_nanos(&wal_meta));
     }
 
+    file_modified
+}
+
+/// 从一份本地可读的 opencode.db 副本同步使用数据。
+///
+/// `local_db_path` 是本机路径（本机库或 WSL 库暂存的本地副本）；
+/// `sync_key` 是稳定的同步水位标识；`file_modified` 是数据源文件的最新
+/// mtime（纳秒），用于判断数据源是否有新内容。
+fn sync_from_db(
+    db: &Database,
+    local_db_path: &Path,
+    sync_key: &str,
+    file_modified: i64,
+) -> Result<SessionSyncResult, AppError> {
     let cursors = crate::services::session_usage::load_sync_cursors(db)?;
-    let last_modified = cursors.get(&db_path_str).map_or(0, |c| c.last_modified);
+    let last_modified = cursors.get(sync_key).map_or(0, |c| c.last_modified);
 
     // 文件未变化则跳过
     if file_modified <= last_modified {
@@ -87,9 +145,11 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
     }
 
     // 打开 opencode 的 SQLite 数据库（只读）
-    let opencode_conn =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| AppError::Database(format!("无法打开 opencode.db: {e}")))?;
+    let opencode_conn = rusqlite::Connection::open_with_flags(
+        local_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| AppError::Database(format!("无法打开 opencode.db: {e}")))?;
 
     let mut result = SessionSyncResult {
         imported: 0,
@@ -106,8 +166,8 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
 
     for (session_id, time_updated) in &sessions {
         // 检查会话是否需要重新同步
-        let sync_key = format!("{db_path_str}:{session_id}");
-        let sess_last_modified = cursors.get(&sync_key).map_or(0, |c| c.last_modified);
+        let session_sync_key = format!("{sync_key}:{session_id}");
+        let sess_last_modified = cursors.get(&session_sync_key).map_or(0, |c| c.last_modified);
         if *time_updated <= sess_last_modified {
             continue; // 会话未更新，跳过
         }
@@ -153,7 +213,7 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
         }
 
         // 更新会话级同步状态。失败时不要推进文件级状态，确保下次可重试。
-        if let Err(e) = update_sync_state(db, &sync_key, *time_updated, 0) {
+        if let Err(e) = update_sync_state(db, &session_sync_key, *time_updated, 0) {
             let msg = format!("OpenCode 会话同步状态更新失败 {session_id}: {e}");
             log::warn!("[OPENCODE-SYNC] {msg}");
             result.errors.push(msg);
@@ -163,7 +223,7 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
 
     // 仅在本轮完全成功时推进文件级状态；否则保留下次重试入口。
     if !has_sync_errors {
-        update_sync_state(db, &db_path_str, file_modified, 0)?;
+        update_sync_state(db, sync_key, file_modified, 0)?;
     }
 
     if result.imported > 0 {
