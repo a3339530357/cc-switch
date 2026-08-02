@@ -1,0 +1,111 @@
+name: Build Windows (fork)
+
+# 个人 fork 专用：在 GitHub Actions 上构建 Windows 版并发布到本仓库 Releases。
+# 上游的 release.yml 依赖 Apple 签名密钥，fork 里没有会导致整个发布被跳过；
+# 这里只构建 Windows，不涉及任何签名 secret。
+#
+# 用法：
+#   - 推送 v* 格式 tag（如 v3.19.1-wsl）：构建后自动创建 Release，产出 MSI + 便携版 zip
+#   - 手动触发（workflow_dispatch）：仅构建并上传 artifact，方便不打 tag 时取文件
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 关闭 updater 产物（不需要），从而免去 TAURI_SIGNING_PRIVATE_KEY 签名要求，
+      # 也避免 fork 缺 secret 导致构建失败。
+      - name: Build Tauri App (Windows)
+        shell: pwsh
+        run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Package assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $VERSION = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$env:GITHUB_RUN_ID" }
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle/msi' -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -ne $msi) {
+            $dest = "CC-Switch-$VERSION-Windows.msi"
+            Copy-Item $msi.FullName (Join-Path release-assets $dest)
+            Write-Host "Installer copied: $dest"
+          } else {
+            Write-Warning 'No MSI installer found'
+          }
+
+          $exe = Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Recurse -Include *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $exe) {
+            $exe = Get-ChildItem -Path 'src-tauri/target/release' -Filter 'cc-switch.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($null -ne $exe) {
+            $portableDir = 'release-assets/portable'
+            New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+            Copy-Item $exe.FullName $portableDir
+            Set-Content -Path (Join-Path $portableDir 'portable.ini') -Value @('# CC Switch portable build marker','portable=true') -Encoding UTF8
+            $portableZip = "release-assets/CC-Switch-$VERSION-Windows-Portable.zip"
+            Compress-Archive -Path "$portableDir/*" -DestinationPath $portableZip -Force
+            Remove-Item -Recurse -Force $portableDir
+            Write-Host "Portable zip created: $portableZip"
+          } else {
+            Write-Warning 'Portable exe not found'
+          }
+
+          Get-ChildItem release-assets
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CC Switch ${{ github.ref_name }} (Windows)
+          prerelease: true
+          files: release-assets/*
+          body: |
+            ## CC Switch ${{ github.ref_name }} (Windows x64)
+
+            - `*.msi`：安装版
+            - `*-Portable.zip`：绿色版（解压运行 `cc-switch.exe`）
+
+            由个人 fork 的 Windows 专用 workflow 构建，未做代码签名，首次运行可能出现 SmartScreen 提示。
