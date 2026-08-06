@@ -11,8 +11,8 @@
 //! 9P/UNC 的单次文件操作延迟远高于本地 NTFS，而增量同步需要对每个文件取
 //! mtime，文件数量级是上千。因此：
 //!
-//! 1. 优先在发行版内跑一次 `find ... -printf '%T@\t%s\t%p\n'`，在 ext4 原生侧
-//!    一把拿到全部路径、mtime 和大小；稳态下 UNC 操作数为 0。
+//! 1. 优先在发行版内跑一次 `find ... -exec stat -c '%.Y %s %n' {} +`，在 ext4
+//!    原生侧一把拿到全部路径、mtime 和大小；稳态下 UNC 操作数为 0。
 //! 2. `find` 不可用（busybox 等无 GNU findutils 的发行版）时，回落到直接
 //!    遍历 UNC 目录。
 //!
@@ -276,22 +276,22 @@ pub(crate) struct FindEntry {
     pub size: u64,
 }
 
-/// 解析 `find -printf '%T@\t%s\t%p\n'` 的输出。
+/// 解析 `stat -c '%.Y %s %n'` 的输出。
 ///
-/// 每行形如 `1754467200.1234567890\t4096\t/home/alice/.claude/projects/x.jsonl`。
-/// 按**前两个**制表符切分，路径取剩余全部，因此路径中含制表符不会破坏解析。
+/// 每行形如 `1754467200.123456789 4096 /home/alice/.claude/projects/x.jsonl`。
+/// 按前两个空格切分，路径取剩余全部。会话文件名是 UUID / 路径转义格式，不含空格。
 ///
 /// 含换行符的路径会被拆成两行，第二行解析失败即丢弃——属于可接受的降级：
 /// 会话文件名遵循 UUID / 时间戳格式，项目目录名是路径转义形式，正常不含换行。
 #[cfg(any(target_os = "windows", test))]
-pub(crate) fn parse_find_output(output: &str, unc_root: &std::path::Path) -> Vec<FindEntry> {
+pub(crate) fn parse_stat_output(output: &str, unc_root: &std::path::Path) -> Vec<FindEntry> {
     let mut entries = Vec::new();
     for line in output.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(3, '\t');
+        let mut parts = line.splitn(3, ' ');
         let (Some(mtime_raw), Some(size_raw), Some(linux_path)) =
             (parts.next(), parts.next(), parts.next())
         else {
@@ -390,10 +390,11 @@ pub fn enumerate(home: &WslHome, rel_root: &str, name_glob: &str, max_depth: u32
     enumerate_via_walk(home, rel_root, name_glob, max_depth)
 }
 
-/// 在发行版内跑 `find`，一次拿到全部路径和 mtime。
+/// 在发行版内跑 `find` + `stat`，一次拿到全部路径、mtime 和大小。
 ///
-/// `-printf` 的格式串以字面量传入（转义由 `find` 自己解释），整条命令走
-/// exec 形式不经 shell，没有命令注入面。
+/// **不用 `find -printf`**：`wsl.exe` 在向 Linux 侧传参时会吞掉反斜杠，
+/// `\t` / `\n` 变成字面 `t` / `n`，`-printf` 的格式串彻底失效。改用
+/// `find ... -exec stat -c '%.Y %s %n' {} +`，`stat` 的格式串不含反斜杠。
 ///
 /// `find` 默认不跟随符号链接，因此 `-type f` 天然排除符号链接文件，也不会
 /// 递归进符号链接目录——与 Grok 宿主扫描器刻意跳过 symlink 的安全语义一致。
@@ -416,12 +417,16 @@ fn enumerate_via_find(
             "f",
             "-name",
             name_glob,
-            "-printf",
-            "%T@\\t%s\\t%p\\n",
+            "-exec",
+            "stat",
+            "-c",
+            "%.Y %s %n",
+            "{}",
+            "+",
         ],
     )?;
 
-    let entries = parse_find_output(&output, &home.unc_root);
+    let entries = parse_stat_output(&output, &home.unc_root);
     Ok(entries
         .into_iter()
         .map(|entry| {
@@ -562,38 +567,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_find_output_handles_tabs_in_paths() {
+    fn parse_stat_output_handles_tabs_in_paths() {
         let root = PathBuf::from(r"\\wsl$\Ubuntu");
-        // 路径含制表符：按第一个 \t 切分，路径部分保持完整
-        let output = "1754467200.5\t4096\t/home/alice/we\tird/x.jsonl\n";
-        let entries = parse_find_output(output, &root);
+        // 路径含空格：按前两个空格切分，第三个字段是路径
+        let output = "1754467200.5 4096 /home/alice/we ird/x.jsonl\n";
+        let entries = parse_stat_output(output, &root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].modified_nanos, Some(1_754_467_200_500_000_000));
         assert_eq!(entries[0].size, 4096);
-        assert!(entries[0].unc_path.to_string_lossy().contains("we\tird"));
+        assert!(entries[0].unc_path.to_string_lossy().contains("we ird"));
     }
 
     #[test]
-    fn parse_find_output_skips_malformed_lines() {
+    fn parse_stat_output_skips_malformed_lines() {
         let root = PathBuf::from(r"\\wsl$\Ubuntu");
         let output = concat!(
-            "1754467200.0\t10\t/home/alice/a.jsonl\n",
+            "1754467200.0 10 /home/alice/a.jsonl\n",
             "no-tab-here\n",
             "\n",
-            "1754467201.0\t10\trelative/path.jsonl\n",
-            "1754467202.0\t20\t/home/alice/b.jsonl\n",
+            "1754467201.0 10 relative/path.jsonl\n",
+            "1754467202.0 20 /home/alice/b.jsonl\n",
         );
-        let entries = parse_find_output(output, &root);
+        let entries = parse_stat_output(output, &root);
         assert_eq!(entries.len(), 2);
         assert!(entries[0].unc_path.to_string_lossy().ends_with("a.jsonl"));
         assert!(entries[1].unc_path.to_string_lossy().ends_with("b.jsonl"));
     }
 
     #[test]
-    fn parse_find_output_marks_unparsable_mtime_for_stat_fallback() {
+    fn parse_stat_output_marks_unparsable_mtime_for_stat_fallback() {
         let root = PathBuf::from(r"\\wsl$\Ubuntu");
-        let output = "-5.0\t123\t/home/alice/ancient.jsonl\n";
-        let entries = parse_find_output(output, &root);
+        let output = "-5.0 123 /home/alice/ancient.jsonl\n";
+        let entries = parse_stat_output(output, &root);
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].modified_nanos, None,
@@ -602,10 +607,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_find_output_tolerates_crlf() {
+    fn parse_stat_output_tolerates_crlf() {
         let root = PathBuf::from(r"\\wsl$\Ubuntu");
-        let output = "1754467200.0\t99\t/home/alice/a.jsonl\r\n";
-        let entries = parse_find_output(output, &root);
+        let output = "1754467200.0 99 /home/alice/a.jsonl\r\n";
+        let entries = parse_stat_output(output, &root);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].unc_path.to_string_lossy().ends_with("a.jsonl"));
     }
