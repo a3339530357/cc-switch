@@ -522,6 +522,10 @@ export function SettingsPage({
                   onSessionAutoSyncEnabledChange={(sessionAutoSyncEnabled) =>
                     handleAutoSave({ sessionAutoSyncEnabled })
                   }
+                  enableWslUsageSync={settings?.enableWslUsageSync ?? false}
+                  onEnableWslUsageSyncChange={(enableWslUsageSync) =>
+                    handleAutoSave({ enableWslUsageSync })
+                  }
                 />
               </TabsContent>
             </div>

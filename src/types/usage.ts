@@ -323,3 +323,10 @@ export interface StatsFilters {
   providerId?: string;
   appType?: string;
 }
+
+/** 某个 WSL 发行版内检测到的工具（detect_wsl_usage_sources 的返回项） */
+export interface WslToolDetection {
+  distro: string;
+  /** 检测到会话数据的工具显示名，如 ["Claude Code", "Codex"] */
+  tools: string[];
+}

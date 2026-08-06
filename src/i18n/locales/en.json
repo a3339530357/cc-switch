@@ -51,6 +51,15 @@
     "bodyOfficial": "An “Official” preset is also included in the list — click it any time you want to switch back to the official default. CC Switch automatically backs up your current config to “default” before switching, so you can move back and forth freely. That's how CC Switch works 😊",
     "confirm": "Got it"
   },
+  "wslUsageNotice": {
+    "title": "AI tools detected in WSL",
+    "body": "CC Switch found session logs for these tools inside your WSL distributions:",
+    "hint": "Once enabled, token usage from these tools in WSL is counted in your statistics. You can turn this off any time under Settings → Usage.",
+    "confirm": "Enable tracking",
+    "decline": "Not now",
+    "settingsLabel": "Sync usage from WSL",
+    "settingsDescription": "Scan session logs for Claude Code, Codex, Gemini and Grok Build inside WSL distributions"
+  },
   "apiKeyInput": {
     "placeholder": "Enter API Key",
     "show": "Show API Key",

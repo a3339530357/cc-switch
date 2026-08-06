@@ -22,6 +22,7 @@ import {
   DatabaseBackup,
   Loader2,
   ScanSearch,
+  Terminal,
 } from "lucide-react";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import {
@@ -34,6 +35,8 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { usageKeys, useModelStats, useProviderStats } from "@/lib/query/usage";
 import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
+import { ToggleRow } from "@/components/ui/toggle-row";
+import { isWindows } from "@/lib/platform";
 import {
   Accordion,
   AccordionContent,
@@ -91,6 +94,10 @@ interface UsageDashboardProps {
   onSessionAutoSyncEnabledChange?: (
     next: boolean,
   ) => Promise<boolean> | boolean | void;
+  enableWslUsageSync?: boolean;
+  onEnableWslUsageSyncChange?: (
+    next: boolean,
+  ) => Promise<boolean> | boolean | void;
 }
 
 export function UsageDashboard({
@@ -98,6 +105,8 @@ export function UsageDashboard({
   onRefreshIntervalChange,
   sessionAutoSyncEnabled = true,
   onSessionAutoSyncEnabledChange,
+  enableWslUsageSync = false,
+  onEnableWslUsageSyncChange,
 }: UsageDashboardProps = {}) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
@@ -113,10 +122,15 @@ export function UsageDashboard({
   const [showRebuildConfirm, setShowRebuildConfirm] = useState(false);
   const [rebuildingCodex, setRebuildingCodex] = useState(false);
   const [syncingSession, setSyncingSession] = useState(false);
+  const [wslSyncEnabled, setWslSyncEnabled] = useState(enableWslUsageSync);
 
   useEffect(() => {
     setRefreshIntervalMs(normalizeRefreshInterval(savedRefreshIntervalMs));
   }, [savedRefreshIntervalMs]);
+
+  useEffect(() => {
+    setWslSyncEnabled(enableWslUsageSync);
+  }, [enableWslUsageSync]);
 
   // 切应用时清掉下游筛选，避免留下一个在新范围内查无数据的"幽灵"组合；
   // 切 Provider 同理清掉模型（模型选项随 Provider 级联）。
@@ -154,6 +168,23 @@ export function UsageDashboard({
         error,
       );
       setRefreshIntervalMs(previous);
+    }
+  };
+
+  const changeWslSync = async (next: boolean) => {
+    const previous = wslSyncEnabled;
+    setWslSyncEnabled(next);
+    try {
+      const saved = await onEnableWslUsageSyncChange?.(next);
+      if (saved === false) {
+        setWslSyncEnabled(previous);
+      } else if (next) {
+        // 开启时立刻跑一次同步，让用户马上看到数据
+        queryClient.invalidateQueries({ queryKey: usageKeys.all });
+      }
+    } catch (error) {
+      console.error("[UsageDashboard] Failed to persist WSL sync setting", error);
+      setWslSyncEnabled(previous);
     }
   };
 
@@ -547,6 +578,36 @@ export function UsageDashboard({
               <PricingConfigPanel />
             </AccordionContent>
           </AccordionItem>
+          {/* WSL 同步只在 Windows 上有意义：其他平台没有 wsl.exe */}
+          {isWindows() && (
+            <AccordionItem
+              value="wsl"
+              className="rounded-xl glass-card overflow-hidden"
+            >
+              <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                <div className="flex items-center gap-3">
+                  <Terminal className="h-5 w-5 text-emerald-500" />
+                  <div className="text-left">
+                    <h3 className="text-base font-semibold">
+                      {t("wslUsageNotice.settingsLabel")}
+                    </h3>
+                    <p className="text-sm text-muted-foreground font-normal">
+                      {t("wslUsageNotice.settingsDescription")}
+                    </p>
+                  </div>
+                </div>
+              </AccordionTrigger>
+              <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                <ToggleRow
+                  icon={<Terminal className="h-4 w-4 text-emerald-500" />}
+                  title={t("wslUsageNotice.settingsLabel")}
+                  description={t("wslUsageNotice.settingsDescription")}
+                  checked={wslSyncEnabled}
+                  onCheckedChange={(value) => void changeWslSync(value)}
+                />
+              </AccordionContent>
+            </AccordionItem>
+          )}
           <AccordionItem
             value="maintenance"
             className="rounded-xl glass-card overflow-hidden"

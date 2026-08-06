@@ -410,6 +410,14 @@ pub struct AppSettings {
     /// User has confirmed the first-run welcome notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_run_notice_confirmed: Option<bool>,
+    /// 是否同步 WSL 发行版内的会话用量（Claude / Codex / Gemini / Grok Build）。
+    /// 仅 Windows 生效，opt-in：默认关闭，由首次检测弹窗开启。
+    #[serde(default)]
+    pub enable_wsl_usage_sync: bool,
+    /// 是否已就「检测到 WSL 内的工具」询问过用户。None = 尚未询问。
+    /// 未检测到工具时后端会直接写 true，避免以后再打扰。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_usage_prompt_confirmed: Option<bool>,
     /// User has confirmed the common config first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_config_confirmed: Option<bool>,
@@ -543,6 +551,8 @@ impl Default for AppSettings {
             unify_codex_migrate_existing: None,
             failover_confirmed: None,
             first_run_notice_confirmed: None,
+            enable_wsl_usage_sync: false,
+            wsl_usage_prompt_confirmed: None,
             common_config_confirmed: None,
             language: None,
             visible_apps: None,

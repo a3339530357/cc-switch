@@ -377,6 +377,10 @@ export interface Settings {
   proxyConfirmed?: boolean;
   // User has confirmed the usage query first-run notice
   usageConfirmed?: boolean;
+  // 是否从 WSL 发行版同步用量统计（仅 Windows，默认关闭）
+  enableWslUsageSync?: boolean;
+  // User has confirmed the WSL usage sync prompt（未询问时为空）
+  wslUsagePromptConfirmed?: boolean;
   usageDashboardRefreshIntervalMs?: number;
   // 会话用量自动扫描开关（默认开启=自动模式；关闭后仅手动同步时扫描会话日志，代理记账不受影响）
   sessionAutoSyncEnabled?: boolean;

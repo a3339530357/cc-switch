@@ -687,7 +687,21 @@ struct CodexFileSyncResult {
 /// 同步 Codex 使用数据（从 JSONL 会话日志）
 pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     let codex_dir = get_codex_config_dir();
-    let files = collect_codex_session_files(&codex_dir);
+    let mut files = collect_codex_session_files(&codex_dir);
+
+    // 追加 WSL 发行版内的会话文件（仅 Windows 有数据）。同时收集其预取的
+    // mtime+size，避免对每个 WSL 文件再走一次 9P stat——Codex 语料常上千文件。
+    let mut wsl_stamps: std::collections::HashMap<PathBuf, (i64, u64)> =
+        std::collections::HashMap::new();
+    {
+        use crate::services::wsl_sessions::{collect_files, WslTool};
+        for f in collect_files(WslTool::Codex) {
+            wsl_stamps.insert(f.unc_path.clone(), (f.modified_nanos, f.size));
+            files.push(f.unc_path);
+        }
+        files.sort();
+    }
+
     let rollout_index = build_rollout_index(&files);
     let mut pass = CodexSyncPass::load(db)?;
 
@@ -701,7 +715,13 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     };
 
     for file_path in &files {
-        match sync_single_codex_file(db, file_path, &rollout_index, &mut pass) {
+        match sync_single_codex_file(
+            db,
+            file_path,
+            &rollout_index,
+            &mut pass,
+            wsl_stamps.get(file_path).copied(),
+        ) {
             Ok(file_result) => {
                 result.imported = result.imported.saturating_add(file_result.imported);
                 result.skipped = result.skipped.saturating_add(file_result.skipped);
@@ -1223,19 +1243,28 @@ fn update_codex_sync_state(
 }
 
 /// 同步单个 Codex JSONL 文件。
+///
+/// `known_stamp`：WSL 路径由 `find` 一并取回 mtime+size，传入可跳过一次
+/// `fs::metadata`；宿主侧传 `None`，自己 stat。`ParentFileStamp` 的
+/// device/inode/volume_id 等身份字段仍走 `fs::File::metadata`，因为这些字
+/// 段本就要打开文件才能稳定拿到，预取收益有限。
 fn sync_single_codex_file(
     db: &Database,
     file_path: &Path,
     rollout_index: &RolloutIndex,
     pass: &mut CodexSyncPass,
+    known_stamp: Option<(i64, u64)>,
 ) -> Result<CodexFileSyncResult, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // 获取文件元数据
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
-    let file_size = metadata.len();
+    let (file_modified, file_size) = match known_stamp {
+        Some((nanos, size)) => (nanos, size),
+        None => {
+            let metadata = fs::metadata(file_path)
+                .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+            (metadata_modified_nanos(&metadata), metadata.len())
+        }
+    };
 
     // 检查同步状态
     let (last_modified, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
@@ -1753,7 +1782,7 @@ mod tests {
             .map(|path| path.to_path_buf())
             .collect::<Vec<_>>();
         let mut pass = CodexSyncPass::load(db)?;
-        sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass)
+        sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass, None)
     }
 
     fn assert_unchanged_codex_file_is_skipped(db: &Database, file: &Path) -> Result<(), AppError> {

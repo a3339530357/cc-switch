@@ -185,17 +185,8 @@ struct ParsedAssistantUsage {
 
 /// 同步 Claude Code 会话日志到使用统计数据库
 pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppError> {
+    // 宿主 ~/.claude/projects
     let projects_dir = get_claude_config_dir().join("projects");
-    if !projects_dir.exists() {
-        return Ok(SessionSyncResult {
-            imported: 0,
-            skipped: 0,
-            files_scanned: 0,
-            suspected_duplicates: 0,
-            deferred_files: 0,
-            errors: vec![],
-        });
-    }
 
     let mut result = SessionSyncResult {
         imported: 0,
@@ -207,14 +198,30 @@ pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppE
     };
 
     // 收集所有 .jsonl 文件
-    let jsonl_files = collect_jsonl_files(&projects_dir);
+    let mut jsonl_files = collect_jsonl_files(&projects_dir);
     let cursors = load_sync_cursors(db)?;
+
+    // WSL 发行版内的 Claude 会话（仅 Windows 有数据，其余平台恒为空）：
+    // `find` 枚举时已带回 mtime+size，作为预取戳跳过逐文件 9P `stat`；
+    // 与宿主文件并入同一循环，聚合口径一致。
+    let mut wsl_stamps: std::collections::HashMap<PathBuf, (i64, u64)> =
+        std::collections::HashMap::new();
+    {
+        use crate::services::wsl_sessions::{collect_files, WslTool};
+        for wsl_file in collect_files(WslTool::Claude) {
+            wsl_stamps.insert(
+                wsl_file.unc_path.clone(),
+                (wsl_file.modified_nanos, wsl_file.size),
+            );
+            jsonl_files.push(wsl_file.unc_path);
+        }
+    }
 
     for file_path in &jsonl_files {
         result.files_scanned += 1;
 
         let cursor = cursors.get(file_path.to_string_lossy().as_ref());
-        match sync_single_file(db, file_path, cursor) {
+        match sync_single_file(db, file_path, cursor, wsl_stamps.get(file_path).copied()) {
             Ok(file_sync) => {
                 result.imported += file_sync.imported;
                 result.skipped += file_sync.skipped;
@@ -407,14 +414,20 @@ fn sync_single_file(
     db: &Database,
     file_path: &Path,
     cursor: Option<&SyncCursor>,
+    known_stamp: Option<(i64, u64)>,
 ) -> Result<ClaudeFileSync, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // 获取文件元数据
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
-    let file_size = metadata.len() as i64;
+    // 获取文件元数据。`known_stamp` 是 WSL `find` 枚举时一并取回的
+    // mtime+size 预取：跳过逐文件 9P `stat`；宿主路径传 `None` 自己 stat。
+    let (file_modified, file_size) = match known_stamp {
+        Some((nanos, size)) => (nanos, size as i64),
+        None => {
+            let metadata = fs::metadata(file_path)
+                .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+            (metadata_modified_nanos(&metadata), metadata.len() as i64)
+        }
+    };
 
     let last_modified = cursor.map_or(0, |c| c.last_modified);
     let last_byte_offset = cursor.and_then(|c| c.last_byte_offset);
@@ -1177,7 +1190,7 @@ mod tests {
     fn sync_with_cursor(db: &Database, path: &Path) -> Result<ClaudeFileSync, AppError> {
         let cursors = load_sync_cursors(db)?;
         let cursor = cursors.get(path.to_string_lossy().as_ref()).copied();
-        sync_single_file(db, path, cursor.as_ref())
+        sync_single_file(db, path, cursor.as_ref(), None)
     }
 
     fn bump_mtime(path: &Path) {
@@ -1525,7 +1538,7 @@ mod tests {
         let empty = r#"{"type":"assistant","message":{"id":"msg_empty","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-06-07T13:01:24Z","sessionId":"session-wf"}"#;
         fs::write(&file, format!("{billable}\n{empty}\n")).unwrap();
 
-        let file_sync = sync_single_file(&db, &file, None)?;
+        let file_sync = sync_single_file(&db, &file, None, None)?;
         assert_eq!(
             file_sync.imported, 1,
             "有 cache 成本但无 stop_reason 的 message 必须被导入"

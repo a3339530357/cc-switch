@@ -6,6 +6,43 @@ use crate::services::usage_stats::*;
 use crate::store::AppState;
 use tauri::State;
 
+/// 某个 WSL 发行版内检测到的工具。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WslToolDetection {
+    pub distro: String,
+    /// 检测到会话数据的工具显示名，如 `["Claude Code", "Codex"]`
+    pub tools: Vec<String>,
+}
+
+/// 探测 WSL 发行版内是否有受支持工具的会话数据。
+///
+/// 供首次启动时的询问弹窗使用。这里**绕过** `enable_wsl_usage_sync` 开关——
+/// 开关还没打开正是要询问的原因。
+///
+/// 非 Windows 平台上 `discover_homes` 返回空列表，因此整个函数是空操作，
+/// 无需 `#[cfg]` 分叉。
+#[tauri::command]
+pub fn detect_wsl_usage_sources() -> Result<Vec<WslToolDetection>, String> {
+    use crate::services::wsl_sessions::{collect_files_for_home, discover_homes, WslTool};
+
+    let mut detections = Vec::new();
+    for home in discover_homes() {
+        let tools: Vec<String> = WslTool::all()
+            .into_iter()
+            .filter(|tool| !collect_files_for_home(&home, *tool).is_empty())
+            .map(|tool| tool.display_name().to_string())
+            .collect();
+
+        if !tools.is_empty() {
+            detections.push(WslToolDetection {
+                distro: home.distro,
+                tools,
+            });
+        }
+    }
+    Ok(detections)
+}
+
 /// 获取使用量汇总
 #[tauri::command]
 pub fn get_usage_summary(

@@ -51,6 +51,15 @@
     "bodyOfficial": "リストには「Official（公式）」プリセットも用意されており、公式バージョンに戻したくなったらクリックするだけで切り替えられます。切り替える前に現在の設定は自動で default にバックアップされるので、自由に行き来できます。これが CC Switch の仕組みです 😊",
     "confirm": "了解しました"
   },
+  "wslUsageNotice": {
+    "title": "WSL 内で AI ツールを検出しました",
+    "body": "CC Switch が WSL ディストリビューション内で以下のツールのセッションログを検出しました:",
+    "hint": "有効にすると、WSL 内のこれらのツールのトークン使用量も統計に含まれます。「設定 → 使用統計」からいつでも無効にできます。",
+    "confirm": "統計を有効にする",
+    "decline": "後で",
+    "settingsLabel": "WSL の使用統計を同期",
+    "settingsDescription": "WSL ディストリビューション内の Claude Code、Codex、Gemini、Grok Build のセッションログをスキャンします"
+  },
   "apiKeyInput": {
     "placeholder": "API Key を入力",
     "show": "API Key を表示",

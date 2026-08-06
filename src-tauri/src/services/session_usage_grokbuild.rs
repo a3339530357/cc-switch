@@ -103,8 +103,8 @@ pub fn sync_grokbuild_usage(db: &Database) -> Result<SessionSyncResult, AppError
 
     let cursors = crate::services::session_usage::load_sync_cursors(db)?;
 
-    for file_path in &files {
-        match sync_single_grok_file(db, file_path, &cursors) {
+    for (file_path, stamp) in &files {
+        match sync_single_grok_file(db, file_path, &cursors, *stamp) {
             Ok(file_result) => result.merge(file_result),
             Err(e) => {
                 let msg = format!("Grok Build 会话文件解析失败 {}: {e}", file_path.display());
@@ -128,11 +128,28 @@ pub fn sync_grokbuild_usage(db: &Database) -> Result<SessionSyncResult, AppError
 }
 
 /// 收集所有 Grok 会话的 updates.jsonl（含归档会话，与会话浏览器同根）
-fn collect_grok_updates_files() -> Vec<PathBuf> {
-    let mut files = Vec::new();
+/// 文件的预取元数据。`(mtime_nanos, size)`。
+///
+/// 宿主侧由 `collect_files_named` 暂时记为 `None` —— 走老路径自己 stat；
+/// WSL 侧由 `find` 一并取回，避免一次 9P stat。
+type GrokFileStamp = Option<(i64, u64)>;
+
+fn collect_grok_updates_files() -> Vec<(PathBuf, GrokFileStamp)> {
+    let mut files: Vec<(PathBuf, GrokFileStamp)> = Vec::new();
     for root in crate::session_manager::providers::grokbuild::session_roots() {
         collect_files_named(&root, "updates.jsonl", &mut files, 0);
     }
+
+    // 仅 Windows 有数据，其他平台 collect_files 恒为空
+    {
+        use crate::services::wsl_sessions::{collect_files, WslTool};
+        files.extend(
+            collect_files(WslTool::GrokBuild)
+                .into_iter()
+                .map(|f| (f.unc_path, Some((f.modified_nanos, f.size)))),
+        );
+    }
+
     files
 }
 
@@ -143,7 +160,12 @@ const MAX_GROK_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_COLLECT_DEPTH: usize = 16;
 
 /// 递归收集目录下指定文件名的文件（容忍布局深度变化，对齐会话浏览器的做法）
-fn collect_files_named(root: &Path, name: &str, files: &mut Vec<PathBuf>, depth: usize) {
+fn collect_files_named(
+    root: &Path,
+    name: &str,
+    files: &mut Vec<(PathBuf, GrokFileStamp)>,
+    depth: usize,
+) {
     if depth > MAX_COLLECT_DEPTH {
         log::warn!(
             "Grok session directory traversal exceeded max depth {} at {}",
@@ -171,31 +193,56 @@ fn collect_files_named(root: &Path, name: &str, files: &mut Vec<PathBuf>, depth:
         if is_dir {
             collect_files_named(&path, name, files, depth + 1);
         } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-            files.push(path);
+            // 宿主侧：暂记 None，sync_single_grok_file 会自己 stat；
+            // 这样 collect_files_named 的语义与历史一致，WSL 侧由调用方注入预取 stamp
+            files.push((path, None));
         }
     }
 }
 
-/// 同步单个 updates.jsonl 文件。游标来自调用方批量预取。
+/// 同步单个 updates.jsonl 文件。游标来自调用方批量预取；`stamp` 为 WSL
+/// `find` 预取的 mtime+size（跳过逐文件 9P stat），宿主路径传 `None`。
 fn sync_single_grok_file(
     db: &Database,
     file_path: &Path,
     cursors: &std::collections::HashMap<String, crate::services::session_usage::SyncCursor>,
+    stamp: GrokFileStamp,
 ) -> Result<SessionSyncResult, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
+    // 宿主侧 stamp=None —— 自己 stat；WSL 侧由 find 一并取回 mtime + size，
+    // 不必再走一次 9P stat
+    let (file_modified, file_size) = match stamp {
+        Some((nanos, size)) => (nanos, Some(size)),
+        None => {
+            let metadata = fs::metadata(file_path)
+                .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+            (metadata_modified_nanos(&metadata), None)
+        }
+    };
 
-    // 异常大文件直接跳过，避免一次性读取耗尽内存。
-    if metadata.len() > MAX_GROK_FILE_BYTES {
-        log::warn!(
-            "Grok session log too large ({} bytes), skipping: {}",
-            metadata.len(),
-            file_path.display()
-        );
-        return Ok(SessionSyncResult::default());
+    if let Some(size) = file_size {
+        // 异常大文件直接跳过，避免一次性读取耗尽内存。
+        if size > MAX_GROK_FILE_BYTES {
+            log::warn!(
+                "Grok session log too large ({} bytes), skipping: {}",
+                size,
+                file_path.display()
+            );
+            return Ok(SessionSyncResult::default());
+        }
+    } else {
+        // 宿主侧还没拿 size，沿用老路径的检查时机（打开文件后用 metadata.len）
+        let metadata = fs::metadata(file_path)
+            .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
+        if metadata.len() > MAX_GROK_FILE_BYTES {
+            log::warn!(
+                "Grok session log too large ({} bytes), skipping: {}",
+                metadata.len(),
+                file_path.display()
+            );
+            return Ok(SessionSyncResult::default());
+        }
     }
 
     let last_modified = cursors.get(&file_path_str).map_or(0, |c| c.last_modified);
@@ -747,6 +794,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 2);
         assert_eq!(result.deferred_files, 0);
@@ -792,6 +840,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 2);
 
@@ -826,6 +875,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 2, "相同数值的两轮都是真实用量");
         assert_eq!(query_rows(&db)?.len(), 2);
@@ -848,6 +898,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 2);
         let rows = query_rows(&db)?;
@@ -879,6 +930,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 1);
         assert_eq!(result.deferred_files, 1);
@@ -892,6 +944,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(rerun.imported, 0);
         assert_eq!(rerun.skipped, 1);
@@ -950,6 +1003,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.skipped, 1, "守卫跳过计入 skipped（未入账）");
         assert_eq!(result.imported, 1);
@@ -982,6 +1036,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(first.imported, 2);
 
@@ -990,6 +1045,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(second.imported + second.skipped, 0);
 
@@ -1002,6 +1058,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(third.imported, 0);
         assert_eq!(third.skipped, 2);
@@ -1039,7 +1096,8 @@ mod tests {
             sync_single_grok_file(
                 &db,
                 &path,
-                &crate::services::session_usage::load_sync_cursors(&db).unwrap()
+                &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+                None
             )?
             .imported,
             3
@@ -1057,6 +1115,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(rescan.imported, 0, "幸存轮不得因序号前移重新入账");
 
@@ -1083,7 +1142,8 @@ mod tests {
             sync_single_grok_file(
                 &db,
                 &path,
-                &crate::services::session_usage::load_sync_cursors(&db).unwrap()
+                &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+                None
             )?
             .imported,
             1
@@ -1113,6 +1173,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 1);
 
@@ -1146,6 +1207,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 1);
 
@@ -1179,6 +1241,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 1);
 
@@ -1220,6 +1283,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 1);
 
@@ -1252,6 +1316,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )?;
         assert_eq!(result.imported, 1);
 
@@ -1290,6 +1355,7 @@ mod tests {
             &db,
             &path,
             &crate::services::session_usage::load_sync_cursors(&db).unwrap(),
+            None,
         )
         .expect("sync should not fail");
         assert_eq!(result.imported, 0, "oversized file must not be imported");

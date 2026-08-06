@@ -14,6 +14,7 @@ import type {
   PaginatedLogs,
   SessionSyncResult,
   DataSourceSummary,
+  WslToolDetection,
 } from "@/types/usage";
 import type { UsageResult } from "@/types";
 import type { AppId } from "./types";
@@ -23,6 +24,14 @@ export const usageApi = {
   // Provider usage script methods
   query: async (providerId: string, appId: AppId): Promise<UsageResult> => {
     return invoke("queryProviderUsage", { providerId, app: appId });
+  },
+
+  /**
+   * 探测 WSL 发行版内是否有受支持工具的会话数据。
+   * 非 Windows 平台恒返回空数组。
+   */
+  detectWslSources: async (): Promise<WslToolDetection[]> => {
+    return invoke("detect_wsl_usage_sources");
   },
 
   testScript: async (

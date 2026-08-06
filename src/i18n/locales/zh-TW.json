@@ -51,6 +51,15 @@
     "bodyOfficial": "清單中還預設了「官方 (Official)」供應商，隨時點擊即可切換回官方預設設定。切換前 CC Switch 會自動將目前設定備份回 default，可以放心來回切換。這就是 CC Switch 的運作方式。",
     "confirm": "我了解了"
   },
+  "wslUsageNotice": {
+    "title": "偵測到 WSL 中的 AI 工具",
+    "body": "CC Switch 在你的 WSL 發行版中發現了以下工具的工作階段記錄：",
+    "hint": "開啟後，這些工具在 WSL 中產生的 token 用量會一併計入統計。你隨時可以在「設定 → 使用統計」中關閉。",
+    "confirm": "開啟統計",
+    "decline": "暫不開啟",
+    "settingsLabel": "同步 WSL 中的用量統計",
+    "settingsDescription": "掃描 WSL 發行版內 Claude Code、Codex、Gemini、Grok Build 的工作階段記錄"
+  },
   "apiKeyInput": {
     "placeholder": "請輸入 API Key",
     "show": "顯示 API Key",

@@ -834,6 +834,23 @@ pub fn run() {
                 log::info!("✓ First-run welcome notice pending");
             }
 
+            // 1.5.1 WSL 用量同步的一次性询问
+            //
+            // 非 Windows 上没有 WSL，直接标记为"已询问"，避免用户在 Windows 和
+            // 其他平台之间共享 settings.json 时反复弹窗。Windows 上是否弹窗由
+            // 前端调用 detect_wsl_usage_sources 决定：探测到工具才弹。
+            #[cfg(not(target_os = "windows"))]
+            {
+                let settings = crate::settings::get_settings();
+                if settings.wsl_usage_prompt_confirmed.is_none() {
+                    let mut updated = settings;
+                    updated.wsl_usage_prompt_confirmed = Some(true);
+                    if let Err(e) = crate::settings::update_settings(updated) {
+                        log::warn!("✗ Failed to mark WSL usage prompt as confirmed: {e}");
+                    }
+                }
+            }
+
             // 1.6. 自动同步累加模式应用的原生 providers 到数据库
             //
             // additive 模式的 import 函数按 id 幂等——
@@ -1592,6 +1609,7 @@ pub fn run() {
             commands::set_auto_failover_enabled,
             // Usage statistics
             commands::get_usage_summary,
+            commands::detect_wsl_usage_sources,
             commands::get_usage_summary_by_app,
             commands::get_usage_trends,
             commands::get_provider_stats,

@@ -167,7 +167,9 @@ fn sync_from_db(
     for (session_id, time_updated) in &sessions {
         // 检查会话是否需要重新同步
         let session_sync_key = format!("{sync_key}:{session_id}");
-        let sess_last_modified = cursors.get(&session_sync_key).map_or(0, |c| c.last_modified);
+        let sess_last_modified = cursors
+            .get(&session_sync_key)
+            .map_or(0, |c| c.last_modified);
         if *time_updated <= sess_last_modified {
             continue; // 会话未更新，跳过
         }
