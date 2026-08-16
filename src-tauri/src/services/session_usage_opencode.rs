@@ -74,11 +74,29 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
             let mut step = SessionSyncResult::default();
             step.files_scanned += 1;
 
+            // 用稳定的源标识做同步水位，避免缓存路径变化导致重复同步
+            let sync_key = format!("wsl:{}:{}", source.distro, source.remote_db_path.display());
+
+            // 水位判定必须早于 stage_source。
+            //
+            // stage_source 是一次无条件的全量 9P 拷贝，而 opencode.db 是长期累积的
+            // 库，实测可达 2.9 GB。把判定留在 sync_from_db 内部意味着：即使远端一个
+            // 字节没变，每个同步周期（60s）也要先整库复制一遍才发现无事可做——实测
+            // 持续写入约 57 MB/s，折合数 TB/天，对 SSD 寿命是实打实的损耗。
+            //
+            // 判定所需的 remote_modified_nanos 在 discover_sources 阶段就已取到
+            // （已含 -wal 的 mtime），因此提前判定不引入任何额外的 9P 开销。
+            let cursors = crate::services::session_usage::load_sync_cursors(db)?;
+            let last_modified = cursors.get(&sync_key).map_or(0, |c| c.last_modified);
+            if source.remote_modified_nanos <= last_modified {
+                // 与 sync_from_db 的跳过分支保持同一计数口径
+                step.files_scanned += 1;
+                aggregate.merge(step);
+                continue;
+            }
+
             match crate::services::wsl_opencode::stage_source(&source) {
                 Ok(local_copy) => {
-                    // 用稳定的源标识做同步水位，避免缓存路径变化导致重复同步
-                    let sync_key =
-                        format!("wsl:{}:{}", source.distro, source.remote_db_path.display());
                     match sync_from_db(db, &local_copy, &sync_key, source.remote_modified_nanos) {
                         Ok(r) => aggregate.merge(r),
                         Err(e) => step

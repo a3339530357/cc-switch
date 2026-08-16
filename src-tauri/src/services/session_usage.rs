@@ -119,6 +119,11 @@ fn merge_sync_step(
 /// 手动同步和 Codex 重建共享，避免 tokio Mutex 重入。
 pub fn sync_all_unlocked(db: &Database) -> SessionSyncResult {
     let mut result = SessionSyncResult::default();
+
+    // 每轮同步重新发现一次 WSL 发行版，本轮内各工具的 collect_files 复用同一份
+    // 结果——发行版发现与工具无关，不该被乘以工具数量。
+    crate::services::wsl_sessions::invalidate_homes_cache();
+
     merge_sync_step(&mut result, "Claude", sync_claude_session_logs(db));
     merge_sync_step(
         &mut result,

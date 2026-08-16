@@ -321,6 +321,10 @@ pub async fn rebuild_codex_usage(
     tauri::async_runtime::spawn_blocking(move || {
         db.backup_database_file()?;
         db.reset_codex_usage()?;
+        // 全量重导必须看到当前真实的发行版列表：这条路径不经过
+        // sync_all_unlocked，缓存不会被自动清空，否则 app 启动后新装的发行版
+        // 会被"重建"漏掉——而重建的语义正是把所有数据重新导一遍。
+        crate::services::wsl_sessions::invalidate_homes_cache();
         let result = crate::services::session_usage_codex::sync_codex_usage(&db);
         finish_codex_rebuild(result)
     })

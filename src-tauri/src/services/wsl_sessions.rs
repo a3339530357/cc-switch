@@ -20,6 +20,7 @@
 //! 数量很少。
 
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 /// 一个 WSL 发行版内选定的用户主目录。
 #[derive(Debug, Clone)]
@@ -146,10 +147,48 @@ pub fn collect_files(tool: WslTool) -> Vec<WslFile> {
     }
 
     let mut files = Vec::new();
-    for home in discover_homes() {
+    for home in discover_homes_cached() {
         files.extend(collect_files_for_home(&home, tool));
     }
     files
+}
+
+/// 一轮同步内复用的发行版发现结果。
+///
+/// [`collect_files`] 被每个受支持工具各调用一次，而发行版发现是与工具无关的
+/// 固定成本（一次 `wsl.exe --list` 加若干次 9P 目录探测，实测合计百毫秒量级），
+/// 逐个工具重复一遍纯属浪费。
+///
+/// 缓存由 [`invalidate_homes_cache`] 在每轮同步开始时显式清空，所以这里不需要
+/// 猜一个 TTL：新装或新启动的发行版最迟在下一轮同步被发现。手动触发的
+/// `detect_wsl_usage_sources` 走 [`discover_homes`] 原函数，不受缓存影响。
+static HOMES_CACHE: LazyLock<Mutex<Option<Vec<WslHome>>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 清空发行版发现缓存，使下一次 [`collect_files`] 重新发现。
+///
+/// 由 `session_usage::sync_all_unlocked` 在每轮同步开始时调用。
+pub fn invalidate_homes_cache() {
+    let mut cache = match HOMES_CACHE.lock() {
+        Ok(c) => c,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *cache = None;
+}
+
+/// 取发行版发现结果，一轮同步内复用。
+fn discover_homes_cached() -> Vec<WslHome> {
+    let mut cache = match HOMES_CACHE.lock() {
+        Ok(c) => c,
+        // 锁中毒只说明某次发现 panic 过，缓存内容本身没有不变式可破坏，
+        // 继续沿用即可，不必让整个用量同步跟着挂掉。
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(homes) = cache.as_ref() {
+        return homes.clone();
+    }
+    let homes = discover_homes();
+    *cache = Some(homes.clone());
+    homes
 }
 
 /// 收集单个主目录下某工具的会话文件（不检查开关，供探测和测试复用）。
@@ -157,6 +196,20 @@ pub(crate) fn collect_files_for_home(home: &WslHome, tool: WslTool) -> Vec<WslFi
     let mut files = Vec::new();
     for (rel_root, name_glob, max_depth) in tool.roots() {
         let root_prefix = unc_root_for(home, rel_root);
+
+        // 会话根不存在就跳过。
+        //
+        // 否则 enumerate 会先起一个 wsl.exe 进发行版跑 find（实测 73~171ms），
+        // find 因目录不存在返回非零退出码，再回落到同样注定失败的 UNC 遍历。
+        // 一次 UNC is_dir（实测约 15ms）把这两步都省掉——多数用户只装了受支持
+        // 工具中的一两个，其余会话根都不存在，每轮都要这么白跑一遍。
+        //
+        // 必须是运行时探测而非按工具静态跳过：装了对应工具的用户这些目录是
+        // 存在的，行为与改动前完全一致（原路径在目录缺失时同样返回空）。
+        if !root_prefix.is_dir() {
+            continue;
+        }
+
         for file in enumerate(home, rel_root, name_glob, *max_depth) {
             let Ok(rel) = file.unc_path.strip_prefix(&root_prefix) else {
                 continue;
@@ -816,5 +869,48 @@ mod tests {
         let home = fake_home(tmp.path());
         assert!(collect_files_for_home(&home, WslTool::Gemini).is_empty());
         assert!(collect_files_for_home(&home, WslTool::GrokBuild).is_empty());
+    }
+
+    #[test]
+    fn invalidate_clears_the_homes_cache() {
+        // 缓存复用只在一轮同步内成立：invalidate 之后必须重新发现，
+        // 否则 app 启动后新装的发行版永远不会被看到。
+        {
+            let mut cache = HOMES_CACHE.lock().expect("lock");
+            *cache = Some(vec![WslHome {
+                distro: "Stale".to_string(),
+                unc_root: PathBuf::from("/nonexistent"),
+                linux_home: "/home/stale".to_string(),
+            }]);
+        }
+        assert!(
+            HOMES_CACHE.lock().expect("lock").is_some(),
+            "前置条件：缓存已填充"
+        );
+
+        invalidate_homes_cache();
+
+        assert!(
+            HOMES_CACHE.lock().expect("lock").is_none(),
+            "invalidate 后缓存必须为空，下次 collect_files 才会重新发现"
+        );
+    }
+
+    #[test]
+    fn collect_files_for_home_skips_missing_roots_without_enumerating() {
+        // 缺失的会话根要在 enumerate 之前被挡掉：否则每轮同步都要为每个
+        // 未安装的工具白起一次 wsl.exe。这里同时确认「跳过」不会误伤存在的根。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("home/alice/.claude/projects/proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("main.jsonl"), "{}").unwrap();
+
+        let home = fake_home(tmp.path());
+
+        // Claude 根存在 → 正常收集
+        assert_eq!(collect_files_for_home(&home, WslTool::Claude).len(), 1);
+        // 其余工具的根不存在 → 空结果，不 panic
+        assert!(collect_files_for_home(&home, WslTool::Codex).is_empty());
+        assert!(collect_files_for_home(&home, WslTool::Gemini).is_empty());
     }
 }
